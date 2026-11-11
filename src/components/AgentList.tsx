@@ -24,6 +24,7 @@ export function AgentList({ agents, selected, wide, onSelect, onRename, onDelete
           <div className="meta"><b>session</b> {a.id.slice(0, 8)}{sessInfo(a)}{a.model && <span className="model">{a.model}</span>}{!!a.context && <span className="model" title="Conversation size right now">ctx {fmtTokens(a.context)}</span>}</div>
           <div className="meta"><b>dir</b> {a.cwd || '(unknown)'}</div>
           {a.waitingFor && <div className="meta"><b>waiting for</b> {a.waitingFor}</div>}
+          {!!a.duplicates?.length && <div className="dupe">⚠ open in {a.duplicates.length + 1} processes</div>}
           {a.peers.length > 0 && <div className="link">↔ talking with {a.peers.join(', ')}</div>}
           {a.last && <div className="snip">{a.last}</div>}
           <div className="card-foot">

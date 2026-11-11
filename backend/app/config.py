@@ -12,8 +12,11 @@ LOCAL_HOME = Path.home() / ".claude"
 HOMES = [LOCAL_HOME] + [Path(p) for p in os.environ.get("CLAUDE_HOMES", "").split(os.pathsep) if p]
 OFFLINE_DAYS = float(os.environ.get("OFFLINE_DAYS", "7"))
 OFFLINE_MAX = int(os.environ.get("OFFLINE_MAX", "30"))
-PERMISSION_MODE = os.environ.get("DASH_PERMISSION_MODE", "acceptEdits")
-USAGE_POLL_MIN = float(os.environ.get("USAGE_POLL_MIN", "3"))
+_MODES = {"acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}
+PERMISSION_MODE = os.environ.get("DASH_PERMISSION_MODE", "auto")
+if PERMISSION_MODE not in _MODES:  # the value ends up on a command line (and in a tmux shell string): allow-list it
+    PERMISSION_MODE = "auto"
+USAGE_POLL_MIN = float(os.environ.get("USAGE_POLL_MIN", "15"))
 CONTEXT_WINDOW = int(os.environ.get("DASH_CONTEXT_WINDOW", "1000000"))
 PEER_WINDOW_S = 30 * 60
 

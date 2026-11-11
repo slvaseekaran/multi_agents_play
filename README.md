@@ -23,7 +23,7 @@ add `-InstallPrerequisites` to have winget install the missing ones.
   new session with copied history; the original stays untouched.
 
 ## Configuration
-Env vars for the backend: `PORT` (7777), `DASH_PERMISSION_MODE` (`acceptEdits`, for headless turns),
+Env vars for the backend: `PORT` (7777), `DASH_PERMISSION_MODE` (`auto`, for headless turns),
 `OFFLINE_DAYS`, `OFFLINE_MAX`, `USAGE_POLL_MIN`, `CLAUDE_HOMES`.
 Desktop app config: `%APPDATA%\AgentDashboard\config.json`; backend log: `%LOCALAPPDATA%\AgentDashboard\backend.log`.
 

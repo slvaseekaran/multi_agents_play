@@ -43,16 +43,36 @@ def permissions_for(session_id: str) -> list[dict]:
     return [p["payload"] for p in r.pending.values()] if r else []
 
 
-def send_tmux(target: str, text: str) -> None:
+_CTRL = {c: None for c in range(32) if c not in (9, 10)}
+_CTRL[127] = None
+
+
+def _clean(text: str) -> str:
+    """Drop terminal control characters: a stray ESC could close the bracketed paste and inject keystrokes,
+    and a bare CR would submit the prompt halfway."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").translate(_CTRL)
+
+
+def _paste(target: str, text: str) -> None:
+    subprocess.run(["tmux", "load-buffer", "-b", "dash", "-"], input=text.encode(), check=True, timeout=5)
+    subprocess.run(["tmux", "paste-buffer", "-p", "-d", "-b", "dash", "-t", target], check=True, timeout=5)
+
+
+def send_tmux(target: str, text: str, images: tuple | list = ()) -> None:
     """Type a prompt into the real Claude Code TUI. Single lines are typed key by key, so slash commands
-    (/clear, /compact, /model ...) behave exactly as in a terminal; multi-line text uses bracketed paste."""
-    if "\n" not in text:
-        subprocess.run(["tmux", "send-keys", "-t", target, "-l", "--", text], check=True, timeout=5)
-        time.sleep(0.35)  # let the slash-command menu settle before Enter
-    else:
-        subprocess.run(["tmux", "load-buffer", "-b", "dash", "-"], input=text.encode(), check=True, timeout=5)
-        subprocess.run(["tmux", "paste-buffer", "-p", "-d", "-b", "dash", "-t", target], check=True, timeout=5)
-        time.sleep(0.2)
+    (/clear, /compact, /model ...) behave exactly as in a terminal; multi-line text uses bracketed paste.
+    Images are pasted by path, which the CLI turns into a real attachment ([Image #1]), as when you paste one."""
+    text = _clean(text)
+    for path in images:
+        _paste(target, str(path))
+        time.sleep(0.5)
+    if text:
+        if "\n" not in text:
+            subprocess.run(["tmux", "send-keys", "-t", target, "-l", "--", (" " if images else "") + text], check=True, timeout=5)
+            time.sleep(0.35)  # let the slash-command menu settle before Enter
+        else:
+            _paste(target, ("\n" if images else "") + text)
+            time.sleep(0.2)
     subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True, timeout=5)
 
 
@@ -68,9 +88,9 @@ def start_tmux(session_id: str, cwd: str | None, create: bool = False) -> str:
     """Start (or find) the real interactive `claude` for this session inside a detached tmux session.
     Resuming keeps the session id and its full history, exactly like `claude --resume` in a terminal."""
     name = session_name(session_id)
-    if subprocess.run(["tmux", "has-session", "-t", name], capture_output=True).returncode == 0:
+    if subprocess.run(["tmux", "has-session", "-t", f"={name}"], capture_output=True).returncode == 0:
         return name
-    cmd = f"{shlex.quote(CLAUDE_BIN)} {'--session-id' if create else '--resume'} {shlex.quote(session_id)}"
+    cmd = f"{shlex.quote(CLAUDE_BIN)} {'--session-id' if create else '--resume'} {shlex.quote(session_id)} --permission-mode {shlex.quote(PERMISSION_MODE)}"
     args = ["tmux", "new-session", "-d", "-s", name, "-x", "200", "-y", "50"]
     if cwd and os.path.isdir(cwd):
         args += ["-c", cwd]
@@ -83,14 +103,21 @@ def capture(target: str, history: int = 80) -> str:
     return out.stdout.rstrip()
 
 
-async def launch(agent: dict, text: str | None, create: bool) -> str:
+async def launch(agent: dict, text: str | None, create: bool, images: tuple | list = ()) -> str:
     """Start the agent's real CLI in tmux, wait until it is ready, then type `text`. Returns '' or an error."""
     sid = agent["id"]
+    reg = await asyncio.to_thread(discovery.live_entry, sid)
+    if reg and not await asyncio.to_thread(lambda: subprocess.run(["tmux", "has-session", "-t", f"={session_name(sid)}"], capture_output=True).returncode == 0):
+        return (f"This session is already open in another process (pid {reg['pid']}). Two copies would garble its history: "
+                "close that one, or use 'move here' to continue it in the dashboard.")
     starting.add(sid)
     try:
         name = await asyncio.to_thread(start_tmux, sid, agent.get("cwd"), create)
         deadline = time.time() + 90
+        has = lambda: subprocess.run(["tmux", "has-session", "-t", f"={name}"], capture_output=True).returncode == 0
         while time.time() < deadline:
+            if not await asyncio.to_thread(has):
+                return "Claude exited right after starting. Check that the session id and folder still exist."
             reg = await asyncio.to_thread(discovery.live_entry, sid)
             if reg and reg.get("status") == "idle":
                 break
@@ -98,8 +125,8 @@ async def launch(agent: dict, text: str | None, create: bool) -> str:
         else:
             return ("The session did not become ready. It may be waiting for input (for example a folder-trust question): "
                     "open the Terminal tab and answer it, then send your message again.")
-        if text:
-            await asyncio.to_thread(send_tmux, name, text)
+        if text or images:
+            await asyncio.to_thread(send_tmux, name, text or "", images)
         return ""
     except subprocess.CalledProcessError as e:
         return f"Could not start the session in tmux: {e}"
@@ -132,9 +159,12 @@ def _payload(rid: str, req: dict) -> dict:
 
 async def _write(run: Run, obj: dict) -> None:
     async with run.write_lock:
-        if run.proc.stdin and not run.proc.stdin.is_closing():
-            run.proc.stdin.write((json.dumps(obj) + "\n").encode())
-            await run.proc.stdin.drain()
+        try:
+            if run.proc.stdin and not run.proc.stdin.is_closing():
+                run.proc.stdin.write((json.dumps(obj) + "\n").encode())
+                await run.proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the process already exited; the pump reports why
 
 
 async def run_turn(agent: dict, text: str, *, fork: bool, create: bool, on_init, on_exit, on_change) -> None:
@@ -147,9 +177,13 @@ async def run_turn(agent: dict, text: str, *, fork: bool, create: bool, on_init,
     if fork:
         args.append("--fork-session")
     cwd = agent.get("cwd") if agent.get("cwd") and os.path.isdir(agent["cwd"]) else None
-    proc = await asyncio.create_subprocess_exec(
-        *args, cwd=cwd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        limit=16 * 1024 * 1024)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=cwd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            limit=16 * 1024 * 1024)
+    except OSError as e:
+        await on_exit(f"Could not start claude: {e}")
+        return
     run = Run(proc)
     key = agent["id"]
     runs[key] = run
@@ -243,5 +277,8 @@ def stop(session_id: str) -> bool:
     if r:
         for p in list(r.pending.values()):
             p["future"].cancel()
-        r.proc.send_signal(2)  # SIGINT
+        try:
+            r.proc.send_signal(2)  # SIGINT
+        except ProcessLookupError:
+            pass
     return bool(r)

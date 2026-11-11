@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { api } from '../api';
 import { fold, type Item } from '../chatItems';
+import { AttachBar, useAttachments } from '../attachments';
 import type { Agent, ChatEvent, LiveMsg, Team } from '../types';
 import { LABEL, resolveName, tagColor } from '../util';
 import { Markdown } from './Markdown';
@@ -122,6 +123,7 @@ function Column({ agent, agents, subscribe, setHead, reading, onOpen }: {
   const seen = useRef(new Set<string>());
   const log = useRef<HTMLDivElement>(null);
   const color = tagColor(id);
+  const att = useAttachments();
 
   const add = useCallback((evs: ChatEvent[]) => {
     const fresh = evs.filter((e) => !seen.current.has(e.id));
@@ -145,11 +147,11 @@ function Column({ agent, agents, subscribe, setHead, reading, onOpen }: {
   const note = (t: string, error = false) => setItems((c) => [...c, { k: 'note', id: crypto.randomUUID(), text: t, error }]);
   async function send() {
     const t = text.trim();
-    if (!t) return;
-    const r = await api(`/api/agents/${id}/send`, { text: t, fork: false });
+    if ((!t && !att.names.length) || att.busy) return;
+    const r = await api(`/api/agents/${id}/send`, { text: t, fork: false, images: att.names });
     if (r.data.needsFork) return note('This session is open in a plain terminal. Open it in the chat view to move it here or fork it.', true);
     if (!r.ok) return note(r.data.error ?? 'Send failed', true);
-    setText('');
+    setText(''); att.clear();
     if (r.data.via === 'tmux-start') note('opening the real Claude session; your message is typed in when it is ready…');
   }
 
@@ -186,9 +188,10 @@ function Column({ agent, agents, subscribe, setHead, reading, onOpen }: {
       </div>
       <PermissionPanel agent={agent} />
       <TerminalKeys agent={agent} />
-      <form className="form" onSubmit={(ev) => { ev.preventDefault(); void send(); }}>
+      <AttachBar att={att} />
+      <form className="form" onSubmit={(ev) => { ev.preventDefault(); void send(); }} onDrop={att.onDrop} onDragOver={att.onDragOver}>
         <span className="prompt">$</span>
-        <textarea rows={1} value={text} placeholder={`message ${agent.name}`}
+        <textarea rows={1} value={text} placeholder={`message ${agent.name}`} onPaste={att.onPaste}
           onChange={(e) => { setText(e.target.value); e.target.style.height = 'auto'; e.target.style.height = `${e.target.scrollHeight}px`; }}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} />
         <button type="submit" disabled={agent.control === 'readonly'}>send</button>

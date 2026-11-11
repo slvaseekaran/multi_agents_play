@@ -31,6 +31,7 @@ export interface Agent {
   peers: string[];
   permissions?: Permission[];
   conflict?: boolean;
+  duplicates?: { pid: number; tty: string; tmuxPane: string; status: string }[];
   context?: number;
   isNew?: boolean;
 }

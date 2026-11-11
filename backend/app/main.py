@@ -37,8 +37,11 @@ _tick_lock = asyncio.Lock()
 
 def emit(type_: str, **data) -> None:
     msg = f"data: {json.dumps({'type': type_, **data})}\n\n"
-    for q in clients:
-        q.put_nowait(msg)
+    for q in list(clients):
+        try:
+            q.put_nowait(msg)
+        except asyncio.QueueFull:  # a stalled browser tab must not grow memory without bound
+            clients.discard(q)
 
 
 def _iso_seconds(ts) -> float:
@@ -70,7 +73,7 @@ def view(a: dict) -> dict:
     perms = control.permissions_for(a["id"])
     status = "waiting" if perms else ("working" if (running or launching) else a["status"])
     # A dashboard-run turn plus a live terminal process on the SAME session means two writers on one history.
-    out.update(status=status, managedRun=running, peers=peers, permissions=perms, conflict=bool(running and a.get("pid")))
+    out.update(status=status, managedRun=running, peers=peers, permissions=perms, conflict=bool((running and a.get("pid")) or a.get("duplicates")))
     if perms:
         out["waitingFor"] = f"permission: {perms[0]['tool']}"
     return out
@@ -102,6 +105,7 @@ async def tick() -> None:
     global agents, agents_json
     async with _tick_lock:
         found, new_events = await asyncio.to_thread(_scan)
+        known = {x["id"] for x in agents}
         agents = found
         for a in found:  # same process, new session id (e.g. after /clear): carry the name over and tell the UI
             pid = a.get("pid")
@@ -112,6 +116,11 @@ async def tick() -> None:
                 names = state.get()["names"]
                 if old in names and a["id"] not in names:
                     names[a["id"]] = names[old]
+                if a["id"] not in known:  # brand-new id in the same process = /clear (a /resume target is already known)
+                    names.pop(old, None)
+                    sup = state.get().setdefault("superseded", [])
+                    if old not in sup:
+                        sup.append(old)  # hide the pre-/clear card: same conversation
                     state.save()
                 emit("fork", **{"from": old, "to": a["id"]})
             pid_session[pid] = a["id"]
@@ -146,7 +155,7 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Agent Dashboard", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
 
 
 @app.middleware("http")
@@ -156,11 +165,21 @@ async def local_only(request: Request, call_next):
         else request.headers["host"].split("]")[0] + "]"
     if host not in ALLOWED_HOSTS:
         return JSONResponse({"error": "forbidden host"}, status_code=403)
+    origin = request.headers.get("origin")
+    if origin and origin not in ALLOWED_ORIGINS:  # a foreign page (the app's own webview is allow-listed)
+        return JSONResponse({"error": "forbidden origin"}, status_code=403)
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         origin = request.headers.get("origin")
         if origin not in ALLOWED_ORIGINS:
             return JSONResponse({"error": "forbidden origin"}, status_code=403)
-    return await call_next(request)
+    m = re.match(r"^/api/agents/([^/]+)/", request.url.path)
+    if m and not discovery.SID_RE.match(m.group(1)):
+        return JSONResponse({"error": "bad session id"}, status_code=400)
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
 
 
 def err(msg: str, code: int = 400, **extra):
@@ -190,7 +209,7 @@ async def list_agents():
 
 @app.get("/api/events")
 async def events(request: Request):
-    q: asyncio.Queue = asyncio.Queue()
+    q: asyncio.Queue = asyncio.Queue(maxsize=2000)
     q.put_nowait(f"data: {json.dumps({'type': 'agents', 'agents': json.loads(agents_json or '[]')})}\n\n")
     q.put_nowait(f"data: {json.dumps({'type': 'usage', 'usage': usage.current})}\n\n")
     q.put_nowait(f"data: {json.dumps({'type': 'teams', 'teams': team_list()})}\n\n")
@@ -211,6 +230,7 @@ async def events(request: Request):
 
 @app.get(f"/api/agents/{{sid}}/messages")
 async def messages(sid: str, limit: int = 300):
+    limit = max(1, min(limit, 2000))
     a = _agent(sid)
     path = a["file"] if a else discovery.transcript_path(sid)
     if not path:
@@ -230,8 +250,9 @@ async def artifacts(sid: str):
 
 
 class SendBody(BaseModel):
-    text: str
+    text: str = ""
     fork: bool = False
+    images: list[str] = []
 
 
 @app.post("/api/agents/{sid}/send")
@@ -239,7 +260,10 @@ async def send(sid: str, body: SendBody):
     a = _agent(sid)
     if not a:
         return err("Unknown agent", 404)
-    if not body.text.strip():
+    imgs = _upload_paths(body.images)
+    if imgs is None:
+        return err("Unknown attachment")
+    if not body.text.strip() and not imgs:
         return err("Empty prompt")
     if control.is_running(sid) or sid in control.starting:
         return err("This agent is still busy", 409)
@@ -248,18 +272,33 @@ async def send(sid: str, body: SendBody):
     if a["control"] == "tmux":
         # Same as typing in the terminal: slash commands, queued messages and dialog answers all work.
         try:
-            await asyncio.to_thread(control.send_tmux, a["tmuxPane"], body.text)
+            await asyncio.to_thread(control.send_tmux, a["tmuxPane"], body.text, imgs)
         except Exception as e:
             return err(str(e), 500)
         return {"via": "tmux"}
     if a["control"] == "managed" and control.tmux_ok():
         # Offline session: start the real CLI (`claude --resume`) in tmux and type the message once it is ready.
         async def go():
-            msg = await control.launch(a, body.text, create=bool(a.get("isNew")))
+            msg = await control.launch(a, body.text, create=bool(a.get("isNew")), images=imgs)
             if msg:
                 emit("note", id=sid, level="error", text=msg)
             await tick()
         t = asyncio.create_task(go()); control._tasks.add(t); t.add_done_callback(control._tasks.discard)
+        await tick()
+        return {"via": "tmux-start"}
+    if a["control"] == "fork" and control.tmux_ok() and a.get("pid") and not a.get("duplicates"):
+        # Keep ONE conversation: move the idle terminal session into tmux (same session id, same history), then send.
+        if a["status"] != "idle":
+            return err(f"This session is {a['status']} in its terminal; send again when it is idle", 409)
+        if not await asyncio.to_thread(discovery.terminate, a["pid"]):
+            return err("Could not close the terminal's Claude process", 409)
+
+        async def move_and_send():
+            msg = await control.launch(a, body.text, create=False, images=imgs)
+            if msg:
+                emit("note", id=sid, level="error", text=msg)
+            await tick()
+        t = asyncio.create_task(move_and_send()); control._tasks.add(t); t.add_done_callback(control._tasks.discard)
         await tick()
         return {"via": "tmux-start"}
     # A session open in a plain terminal is never written to in place (two writers would corrupt its history):
@@ -278,9 +317,72 @@ async def send(sid: str, body: SendBody):
             emit("note", id=sid, level="error", text=error)
         await tick()
 
-    await control.run_turn(a, body.text, fork=do_fork, create=bool(a.get("isNew")), on_init=on_init, on_exit=on_exit, on_change=tick)
+    control.starting.add(sid)  # reserve: two quick sends must not spawn two writers on one session
+    try:
+        await control.run_turn(a, body.text + "".join(f"\n[image: {p}]" for p in imgs), fork=do_fork, create=bool(a.get("isNew")), on_init=on_init, on_exit=on_exit, on_change=tick)
+    finally:
+        control.starting.discard(sid)
     await tick()
     return {"via": "fork" if do_fork else "managed"}
+
+
+UPLOAD_DIR = DATA_DIR / "uploads"
+_IMG_MAGIC = ((b"\xff\xd8\xff", "jpg"), (b"\x89PNG\r\n\x1a\n", "png"), (b"GIF8", "gif"))
+
+
+def _upload_paths(names: list[str]) -> list[str] | None:
+    """Attachments are only ever files this backend saved itself (no arbitrary paths from the client)."""
+    out = []
+    for n in names:
+        p = (UPLOAD_DIR / os.path.basename(n)).resolve()
+        if p.parent != UPLOAD_DIR.resolve() or not p.is_file():
+            return None
+        out.append(str(p))
+    return out
+
+
+@app.post("/api/uploads")
+async def upload(request: Request):
+    """Save a pasted/dropped image so it can be attached to a message. Returns the stored file name."""
+    if int(request.headers.get("content-length") or 0) > 25_000_000:
+        return err("Image too large (25 MB max)", 413)
+    buf = b""
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > 25_000_000:
+            return err("Image too large (25 MB max)", 413)
+    ext = next((e for m, e in _IMG_MAGIC if buf.startswith(m)), None) or ("webp" if buf[:4] == b"RIFF" and buf[8:12] == b"WEBP" else None)
+    if not ext:
+        return err("Use a PNG, JPEG, GIF or WebP image")
+    UPLOAD_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cutoff = time.time() - 7 * 86400  # keep uploads a week; old ones are swept on the next upload
+    for f in UPLOAD_DIR.iterdir():
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+        except OSError:
+            pass
+    name = f"{uuid.uuid4().hex}.{ext}"
+    fd = os.open(UPLOAD_DIR / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(buf)
+    return {"name": name}
+
+
+@app.post("/api/agents/{sid}/dedupe")
+async def dedupe(sid: str):
+    """The session is open in several processes: close the extra ones (only if idle) and keep the card's own."""
+    a = _agent(sid)
+    if not a or not a.get("duplicates"):
+        return err("Nothing to close", 404)
+    if a["status"] not in ("idle", "offline") or any(d["status"] != "idle" for d in a["duplicates"]):
+        return err("Wait until every copy of this session is idle", 409)
+    closed = 0
+    for d in a["duplicates"]:
+        if await asyncio.to_thread(discovery.terminate, d["pid"]):
+            closed += 1
+    await tick()
+    return {"closed": closed}
 
 
 @app.post("/api/agents/{sid}/start")
@@ -367,7 +469,7 @@ async def keys(sid: str, body: KeysBody):
         return err("Only sessions running in tmux can receive key presses", 400)
     try:
         await asyncio.to_thread(control.send_keys, a["tmuxPane"], body.keys)
-    except (ValueError, subprocess.CalledProcessError) as e:
+    except (ValueError, subprocess.SubprocessError) as e:
         return err(str(e))
     return {"ok": True}
 
@@ -376,7 +478,10 @@ async def keys(sid: str, body: KeysBody):
 async def stop(sid: str):
     a = _agent(sid)
     if a and a["control"] == "tmux":  # same as pressing Esc to interrupt in the CLI
-        await asyncio.to_thread(control.send_keys, a["tmuxPane"], ["Escape"])
+        try:
+            await asyncio.to_thread(control.send_keys, a["tmuxPane"], ["Escape"])
+        except (ValueError, subprocess.SubprocessError) as e:
+            return err(str(e), 500)
         return {"stopped": True}
     return {"stopped": control.stop(sid)}
 
@@ -387,6 +492,8 @@ class RenameBody(BaseModel):
 
 @app.post("/api/agents/{sid}/rename")
 async def rename(sid: str, body: RenameBody):
+    if not _agent(sid):
+        return err("Unknown agent", 404)
     clean = body.name.strip()[:60]
     if clean:
         state.get()["names"][sid] = clean
@@ -523,6 +630,8 @@ async def get_background():
 
 @app.post("/api/background")
 async def set_background(request: Request):
+    if int(request.headers.get("content-length") or 0) > 40_000_000:
+        return err("Image too large (40 MB max)", 413)
     buf = b""
     async for chunk in request.stream():
         buf += chunk
@@ -532,7 +641,7 @@ async def set_background(request: Request):
         "webp" if buf[:4] == b"RIFF" and buf[8:12] == b"WEBP" else None
     if not ext:
         return err("Use a JPEG, PNG or WebP image")
-    BG_DIR.mkdir(parents=True, exist_ok=True)
+    BG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     for f in BG_DIR.iterdir():
         if f.name.startswith("continental-gt-650-rocker-red."):
             f.unlink()

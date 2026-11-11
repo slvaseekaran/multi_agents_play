@@ -4,6 +4,7 @@ import type { Agent, ArtifactItem, ChatEvent, LiveMsg } from '../types';
 import { LABEL, MODE, ago, canDelete, resolveName, sessInfo } from '../util';
 import { Markdown } from './Markdown';
 import { fold, type Item } from '../chatItems';
+import { AttachBar, useAttachments } from '../attachments';
 import { fmtTokens } from './UsagePanel';
 import { PermissionPanel, ScreenView, TerminalKeys } from './Permissions';
 
@@ -19,6 +20,7 @@ export function ChatPane({ agent, agents, subscribe, onClose, onRename, onDelete
   const [arts, setArts] = useState<ArtifactItem[]>([]);
   const [text, setText] = useState('');
   const [tab, setTab] = useState<'chat' | 'terminal'>('chat');
+  const att = useAttachments();
   const seen = useRef(new Set<string>());
   const toolNames = useRef(new Map<string, string>());
   const log = useRef<HTMLDivElement>(null);
@@ -62,16 +64,17 @@ export function ChatPane({ agent, agents, subscribe, onClose, onRename, onDelete
 
   async function send() {
     const t = text.trim();
-    if (!t) return;
-    let r = await api(`/api/agents/${id}/send`, { text: t, fork: false });
+    if ((!t && !att.names.length) || att.busy) return;
+    const images = att.names;
+    let r = await api(`/api/agents/${id}/send`, { text: t, fork: false, images });
     if (r.data.needsFork) {
       // Never silently replace or write into a session that is open in a terminal: ask first.
       const ok = await confirmFork('fork session?', `${r.data.error}\n\nFork a copy of this conversation and send there? The original session stays untouched.\n(Or cancel and use "move here" to continue the same session in the dashboard.)`, 'fork and send');
       if (!ok) return;
-      r = await api(`/api/agents/${id}/send`, { text: t, fork: true });
+      r = await api(`/api/agents/${id}/send`, { text: t, fork: true, images });
     }
     if (!r.ok) return note(r.data.error ?? 'Send failed', true);
-    setText('');
+    setText(''); att.clear();
     if (r.data.via === 'tmux-start') note('opening the real Claude session; your message is typed in as soon as it is ready…');
   }
 
@@ -90,7 +93,16 @@ export function ChatPane({ agent, agents, subscribe, onClose, onRename, onDelete
           </div>
         </div>
         <div className="meta pad"><b>session</b> {agent.id}{sessInfo(agent)}{agent.model && <span className="model">{agent.model}</span>}{!!agent.context && <span className="model" title="Conversation size right now">ctx {fmtTokens(agent.context)}</span>}<br /><b>dir</b> {agent.cwd}</div>
-        {agent.conflict && (
+        {!!agent.duplicates?.length && (
+          <div className="conflict">This session is also open in {agent.duplicates.length} other process{agent.duplicates.length > 1 ? 'es' : ''}
+            {' '}({agent.duplicates.map((d) => `pid ${d.pid}${d.tty ? ' · ' + d.tty : ''}`).join(', ')}). Two writers on one history garble it.
+            <button className="ghost sm danger" onClick={async () => {
+              if (!(await confirmFork('close the other copy?', `This closes the other Claude process on this session (${agent.duplicates!.map((d) => 'pid ' + d.pid).join(', ')}) and keeps the one shown here. The conversation is not deleted. Anything unsent in that terminal is lost.`, 'close it'))) return;
+              const r = await api(`/api/agents/${id}/dedupe`, {});
+              if (!r.ok) note(r.data.error ?? 'Could not close it', true);
+            }}>close the other</button></div>
+        )}
+        {agent.conflict && !agent.duplicates?.length && (
           <div className="conflict">This session is open in a terminal AND running a dashboard turn. Two writers on one history will garble it: stop the dashboard turn or close the terminal.
             <button className="ghost sm danger" onClick={() => api(`/api/agents/${id}/stop`, {})}>stop dashboard turn</button></div>
         )}
@@ -133,9 +145,10 @@ export function ChatPane({ agent, agents, subscribe, onClose, onRename, onDelete
         </div>}
         <PermissionPanel agent={agent} />
         {tab === 'chat' && <TerminalKeys agent={agent} />}
-        <form className="form" onSubmit={(ev) => { ev.preventDefault(); void send(); }}>
+        <AttachBar att={att} />
+        <form className="form" onSubmit={(ev) => { ev.preventDefault(); void send(); }} onDrop={att.onDrop} onDragOver={att.onDragOver}>
           <span className="prompt">$</span>
-          <textarea rows={1} value={text} placeholder="message or /command, sent exactly like in the terminal" autoFocus
+          <textarea rows={1} value={text} onPaste={att.onPaste} placeholder="message or /command, sent exactly like in the terminal" autoFocus
             onChange={(e) => { setText(e.target.value); e.target.style.height = 'auto'; e.target.style.height = `${e.target.scrollHeight}px`; }}
             onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} />
           {(agent.managedRun || (agent.control === 'tmux' && agent.status === 'working')) && <button type="button" className="ghost" title="Interrupt (Esc)" onClick={() => api(`/api/agents/${id}/stop`, {})}>stop</button>}

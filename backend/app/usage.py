@@ -51,7 +51,8 @@ async def ping() -> None:
         _last_ping = time.time()
         try:
             p = await asyncio.create_subprocess_exec(
-                CLAUDE_BIN, "-p", "--model", "haiku", "--no-session-persistence", "--output-format", "stream-json", "--verbose",
+                CLAUDE_BIN, "-p", "--model", "haiku", "--no-session-persistence", "--tools", "", "--disable-slash-commands",
+                "--strict-mcp-config", "--system-prompt", "Reply with: ok", "--output-format", "stream-json", "--verbose",
                 cwd=tempfile.gettempdir(), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL, limit=16 * 1024 * 1024)
             p.stdin.write(b"ok")
@@ -69,7 +70,10 @@ async def ping() -> None:
             await asyncio.wait_for(read(), 60)
             await p.wait()
         except (OSError, asyncio.TimeoutError):
-            pass
+            try:
+                p.kill()  # never leave a stuck probe behind
+            except (UnboundLocalError, ProcessLookupError):
+                pass
 
 
 def request_refresh(delay: float = 15.0) -> None:
@@ -83,7 +87,7 @@ def request_refresh(delay: float = 15.0) -> None:
         global _pending
         try:
             await asyncio.sleep(delay)
-            if time.time() - _last_ping > 45:
+            if time.time() - _last_ping > 300:
                 await ping()
         finally:
             _pending = False

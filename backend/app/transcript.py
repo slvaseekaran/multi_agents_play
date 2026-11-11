@@ -51,6 +51,8 @@ def parse_record(rec: dict) -> list[dict]:
     content = msg.get("content")
     blocks = [{"type": "text", "text": content}] if isinstance(content, str) else (content or [])
     for b in blocks:
+        if not isinstance(b, dict):
+            continue
         t = b.get("type")
         if t == "text" and (b.get("text") or "").strip():
             text = b["text"]
@@ -90,8 +92,8 @@ def parse_lines(text: str) -> list[dict]:
             continue
         try:
             events.extend(parse_record(json.loads(line)))
-        except ValueError:
-            pass  # partial or foreign line
+        except (ValueError, AttributeError, TypeError):
+            pass  # partial or foreign line: one odd record must never break the whole tick
     return events
 
 
@@ -177,7 +179,8 @@ def read_meta(path) -> dict:
             meta["cwd"] = json.loads(f'"{m.group(1)}"')
         except ValueError:
             pass
-    tail = _read(path, max(0, size - 200000), size).decode("utf-8", "replace")
+    tstart = max(0, size - 200000)
+    tail = _read(path, tstart, size).decode("utf-8", "replace")
     titles = AI_TITLE.findall(tail)
     if titles:
         try:
@@ -187,7 +190,7 @@ def read_meta(path) -> dict:
     models = MODEL.findall(tail)
     meta["model"] = models[-1].removeprefix("claude-") if models else ""
     meta["context"] = _last_context(tail)
-    chat = [e for e in parse_lines(tail[tail.find("\n") + 1:]) if e["role"] in ("user", "assistant")]
+    chat = [e for e in parse_lines(tail[tail.find("\n") + 1:] if tstart else tail) if e["role"] in ("user", "assistant")]
     if chat:
         meta["last"] = _clip(" ".join(chat[-1]["text"].split()), 140)
     return meta
